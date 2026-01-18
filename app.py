@@ -1,29 +1,45 @@
 import streamlit as st
 import pandas as pd
 import datetime
+import uuid
 from supabase import create_client, Client
 
 # --- Page Configuration ---
 st.set_page_config(page_title="Daily Sales Collection Form", layout="wide")
 
+# --- Initialize Session State for Duplicate Prevention ---
+if 'transaction_id' not in st.session_state:
+    st.session_state.transaction_id = str(uuid.uuid4())
+
+# We store the shop data in session state so it doesn't vanish when you interact with other widgets
+if 'shop_data' not in st.session_state:
+    # Starting with one empty row for dynamic entry
+    st.session_state.shop_data = pd.DataFrame([{"Shop ID": "", "Amount Deposited": 0.0}])
+
+def clear_form():
+    """Resets the transaction ID and form data after success"""
+    st.session_state.transaction_id = str(uuid.uuid4())
+    st.session_state.shop_data = pd.DataFrame([{"Shop ID": "", "Amount Deposited": 0.0}])
+    st.rerun()
+
 # --- Supabase Connection Function ---
-def save_to_supabase(date, exec_id, route, total_declared, table_df):
+def save_to_supabase(date, exec_id, route, cash, credit, total, table_df, txn_id):
     try:
-        # Load credentials from Streamlit Secrets
-        # You will add these in the Streamlit Dashboard later
         url = st.secrets["SUPABASE_URL"]
         key = st.secrets["SUPABASE_KEY"]
-        
         supabase: Client = create_client(url, key)
         
         # Prepare data list
         data_to_insert = []
         for index, row in table_df.iterrows():
             entry = {
+                "transaction_id": txn_id, # Prevents duplicates
                 "date": str(date),
                 "executive_id": exec_id,
                 "route_name": route,
-                "total_declared": total_declared,
+                "cash_amount": cash,
+                "credit_amount": credit,
+                "total_declared": total,
                 "shop_id": int(row["Shop ID"]),
                 "amount_deposited": float(row["Amount Deposited"])
             }
@@ -33,10 +49,14 @@ def save_to_supabase(date, exec_id, route, total_declared, table_df):
         response = supabase.table("SalesData").insert(data_to_insert).execute()
         return True
     except Exception as e:
-        st.error(f"Error saving to Supabase: {e}")
+        if "unique constraint" in str(e):
+             st.error("Error: This entry has already been submitted.")
+        else:
+             st.error(f"Error saving to Supabase: {e}")
         return False
 
 st.title("Daily Sales Collection Form")
+st.caption(f"Transaction Ref: {st.session_state.transaction_id}")
 st.markdown("---")
 
 # ==========================================
@@ -78,60 +98,98 @@ with col1:
 
 with col2:
     exec_id = st.selectbox("2. Sale Executive ID", executive_ids_list)
-    total_deposited = st.number_input(
-        "4. Total Amount Deposited (Total Cash Handoff)",
-        min_value=0.0, format="%.2f", step=0.01
-    )
+    
+    # --- SPLIT INPUTS ---
+    c1, c2 = st.columns(2)
+    with c1:
+        cash_deposited = st.number_input("Cash Sales Deposited", min_value=0.0, format="%.2f", step=100.0)
+    with c2:
+        credit_deposited = st.number_input("Credit Sales Deposited", min_value=0.0, format="%.2f", step=100.0)
+    
+    # Auto-calculate Total
+    total_deposited = cash_deposited + credit_deposited
+    st.metric("Total Deposited (Cash + Credit)", f"{total_deposited:,.2f}")
 
 st.markdown("---")
 
-st.subheader("Shop Collection Details")
-st.info("Enter details in the grid below. You can copy-paste data from Excel into this grid.")
+# ==========================================
+# SECTION 2: SHOP COLLECTION & VALIDATION
+# ==========================================
+st.subheader("Shop Collection Details (Credit Breakdown)")
+st.info("Enter details below. The Total here must match 'Credit Sales Deposited'.")
 
-num_rows = 40
-data_structure = {
-    "S.no": list(range(1, num_rows + 1)),
-    "Shop ID": [pd.NA] * num_rows,
-    "Amount Deposited": [pd.NA] * num_rows,
-}
+# 1. Calculate the Live Total of the table
+current_shop_total = pd.to_numeric(st.session_state.shop_data["Amount Deposited"], errors='coerce').sum()
 
-df_initial = pd.DataFrame(data_structure)
+# 2. Validation Logic
+is_valid = False
+match_col1, match_col2 = st.columns([2, 3])
 
+with match_col1:
+    st.markdown(f"**Current Shop Total:** :blue[{current_shop_total:,.2f}]")
+
+with match_col2:
+    if abs(current_shop_total - credit_deposited) < 0.01:
+        st.success("✅ Balanced: Shop Total matches Credit Sales")
+        is_valid = True
+    else:
+        diff = credit_deposited - current_shop_total
+        st.error(f"❌ Mismatch: Difference of {diff:,.2f}")
+        is_valid = False
+
+# 3. Dynamic Data Editor
 edited_df = st.data_editor(
-    df_initial,
+    st.session_state.shop_data,
     column_config={
-        "S.no": st.column_config.NumberColumn("S.no", disabled=True, width="small"),
         "Shop ID": st.column_config.NumberColumn("Shop ID", min_value=1, step=1, format="%d", width="medium"),
         "Amount Deposited": st.column_config.NumberColumn("Amount Deposited", min_value=0.0, format="%.2f", step=0.01, width="medium"),
     },
-    hide_index=True, use_container_width=True, num_rows="fixed"
+    num_rows="dynamic", # Allows adding/deleting rows dynamically
+    use_container_width=True,
+    key="editor"
 )
+
+# Update session state with changes so they persist
+st.session_state.shop_data = edited_df
 
 st.markdown("---")
 
-if st.button("Submit Collection Data", type="primary"):
+# ==========================================
+# SECTION 3: SUBMISSION
+# ==========================================
+
+# Button is disabled if totals don't match
+if st.button("Submit Collection Data", type="primary", disabled=not is_valid):
     errors = []
     if exec_id == executive_ids_list[0]: errors.append("Please select a valid Sale Executive ID.")
     if route_name == route_names_list[0]: errors.append("Please select a valid Route Name.")
+    if total_deposited == 0: errors.append("Total Deposited cannot be zero.")
 
+    # Clean Data
     clean_df = edited_df.copy()
     clean_df["Shop ID"] = pd.to_numeric(clean_df["Shop ID"], errors='coerce')
     clean_df["Amount Deposited"] = pd.to_numeric(clean_df["Amount Deposited"], errors='coerce')
-    submission_data = clean_df.dropna(subset=["Shop ID", "Amount Deposited"], how='all')
-    submission_data = submission_data[submission_data["Shop ID"].notna() | submission_data["Amount Deposited"].notna()]
+    submission_data = clean_df.dropna(subset=["Shop ID", "Amount Deposited"], how='any')
 
-    if submission_data.empty: errors.append("Please enter at least one entry in the Shop Details table.")
-
-    table_total = submission_data["Amount Deposited"].sum()
-    if abs(table_total - total_deposited) > 0.01:
-         st.warning(f"⚠️ Warning: Total declared ({total_deposited:.2f}) does not match table sum ({table_total:.2f}).")
+    if submission_data.empty: errors.append("Please enter at least one shop entry.")
 
     if errors:
         for err in errors: st.error(err)
     else:
         with st.spinner("Saving to Supabase Database..."):
-            success = save_to_supabase(submission_date, exec_id, route_name, total_deposited, submission_data)
+            # Pass all new split fields and the transaction ID
+            success = save_to_supabase(
+                submission_date, 
+                exec_id, 
+                route_name, 
+                cash_deposited, 
+                credit_deposited, 
+                total_deposited, 
+                submission_data,
+                st.session_state.transaction_id
+            )
             
         if success:
             st.success("✅ Data Submitted Successfully!")
             st.balloons()
+            clear_form() # Resets ID and clears table
