@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import datetime
 import uuid
-import time  # <--- NEW: Needed for the delay
+import time
 from supabase import create_client, Client
 
 # --- 1. CONFIGURATION ---
@@ -12,20 +12,19 @@ st.set_page_config(page_title="Sales Entry", layout="wide")
 if 'transaction_id' not in st.session_state:
     st.session_state.transaction_id = str(uuid.uuid4())
 
-# Initialize Table Data (Persistent)
+# Initialize Table Data
 if 'shop_data' not in st.session_state:
+    # Start with 5 empty rows
     st.session_state.shop_data = pd.DataFrame(
         [{"Shop ID": None, "Amount Deposited": None} for _ in range(5)]
     )
 
-def clear_form():
-    """Reset form after success"""
+def clear_form_data():
+    """Reset data and generate new ID"""
     st.session_state.transaction_id = str(uuid.uuid4())
     st.session_state.shop_data = pd.DataFrame(
         [{"Shop ID": None, "Amount Deposited": None} for _ in range(5)]
     )
-    # No rerun here immediately, we handle it in the main flow
-    st.rerun()
 
 # --- 2. DATABASE FUNCTION ---
 def save_to_supabase(date, exec_id, route, cash, credit, total, table_df, txn_id):
@@ -58,7 +57,7 @@ def save_to_supabase(date, exec_id, route, cash, credit, total, table_df, txn_id
              st.error(f"Database Error: {e}")
         return False
 
-# --- 3. UI: HEADERS ---
+# --- 3. UI: TOP SECTION (Live Updates) ---
 st.title("Daily Sales Entry")
 st.caption(f"Ref: {st.session_state.transaction_id}")
 
@@ -83,6 +82,7 @@ route_names_list = [
     "KV08-Pathanapuram"
 ]
 
+# Inputs outside the form so they update instantly
 c1, c2 = st.columns(2)
 with c1:
     submission_date = st.date_input("Date", datetime.date.today())
@@ -98,72 +98,64 @@ with c2:
 
 total_deposited = cash_deposited + credit_deposited
 
-# --- 4. UI: TABLE ---
 st.markdown("---")
+
+# --- 4. UI: THE FORM (Stops Auto-Reload) ---
 st.subheader("Shop Collection Details")
+st.info("Enter all shops below. The app will NOT reload while you type.")
 
-# Table
-edited_df = st.data_editor(
-    st.session_state.shop_data,
-    column_config={
-        "Shop ID": st.column_config.NumberColumn("Shop ID", min_value=1, format="%d"),
-        "Amount Deposited": st.column_config.NumberColumn("Amount Deposited", min_value=0.0, format="%.2f"),
-    },
-    num_rows="dynamic",
-    use_container_width=True,
-    key="shop_editor"
-)
-st.session_state.shop_data = edited_df
+with st.form("entry_form", clear_on_submit=False):
+    # The Table
+    # We use st.session_state.shop_data as the starting point
+    edited_df = st.data_editor(
+        st.session_state.shop_data,
+        column_config={
+            "Shop ID": st.column_config.NumberColumn("Shop ID", min_value=1, format="%d"),
+            "Amount Deposited": st.column_config.NumberColumn("Amount Deposited", min_value=0.0, format="%.2f"),
+        },
+        num_rows="dynamic",
+        use_container_width=True
+    )
+    
+    # The Submit Button
+    submitted = st.form_submit_button("Verify & Submit Entry", type="primary")
 
-# --- 5. LOGIC: CALCULATION ---
-clean_df = edited_df.dropna(subset=["Shop ID", "Amount Deposited"], how='any')
-current_shop_total = clean_df["Amount Deposited"].sum()
-
-# Validation
-is_valid = False
-msg_col1, msg_col2 = st.columns([1, 2])
-with msg_col1:
-    st.metric("Current Shop Total", f"{current_shop_total:,.2f}")
-with msg_col2:
-    diff = credit_deposited - current_shop_total
-    if credit_deposited == 0 and current_shop_total == 0:
-        st.info("Enter amounts to begin.")
-        is_valid = True
-    elif abs(diff) < 0.01:
-        st.success("✅ Perfect Match!")
-        is_valid = True
-    else:
-        st.error(f"❌ Mismatch: Difference is {diff:,.2f}")
+    if submitted:
+        # --- VALIDATION LOGIC ---
+        # 1. Clean Data
+        clean_df = edited_df.dropna(subset=["Shop ID", "Amount Deposited"], how='any')
+        current_shop_total = clean_df["Amount Deposited"].sum()
+        
+        # 2. Check Math
+        diff = credit_deposited - current_shop_total
         is_valid = False
-
-st.markdown("---")
-
-# --- 6. SUBMIT ---
-submit_disabled = not is_valid
-
-if st.button("Submit Entry", type="primary", disabled=submit_disabled):
-    errors = []
-    if exec_id == "Select Executive ID": errors.append("Select an Executive.")
-    if route_name == "Select Route Name": errors.append("Select a Route.")
-    if total_deposited <= 0: errors.append("Total amount cannot be zero.")
-    if credit_deposited > 0 and clean_df.empty: errors.append("Credit Sales listed but no shops entered.")
-
-    if errors:
-        for e in errors: st.error(e)
-    else:
-        with st.spinner("Saving..."):
-            success = save_to_supabase(
-                submission_date, exec_id, route_name, 
-                cash_deposited, credit_deposited, total_deposited,
-                clean_df, st.session_state.transaction_id
-            )
+        
+        if exec_id == "Select Executive ID":
+            st.error("⚠️ Please select an Executive ID.")
+        elif route_name == "Select Route Name":
+            st.error("⚠️ Please select a Route Name.")
+        elif total_deposited <= 0:
+            st.error("⚠️ Total Amount cannot be zero.")
+        elif credit_deposited > 0 and clean_df.empty:
+            st.error("⚠️ You entered Credit Sales but the Shop list is empty.")
+        elif abs(diff) > 0.01:
+            st.error(f"❌ MISMATCH: Credit is {credit_deposited:,.2f} but Shop Total is {current_shop_total:,.2f}. Diff: {diff:,.2f}")
+        else:
+            is_valid = True
             
-            if success:
-                st.success("✅ Saved Successfully! The form will clear in 2 seconds...")
-                st.balloons()
+        # 3. Save if Valid
+        if is_valid:
+            with st.spinner("Saving data..."):
+                success = save_to_supabase(
+                    submission_date, exec_id, route_name, 
+                    cash_deposited, credit_deposited, total_deposited,
+                    clean_df, st.session_state.transaction_id
+                )
                 
-                # --- NEW: DELAY BEFORE CLEARING ---
-                time.sleep(2) 
-                
-                # Now clear and restart
-                clear_form()
+                if success:
+                    st.success("✅ Saved Successfully!")
+                    st.balloons()
+                    time.sleep(2)
+                    # Clear data and Reload
+                    clear_form_data()
+                    st.rerun()
